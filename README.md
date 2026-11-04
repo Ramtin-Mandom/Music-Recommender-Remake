@@ -16,7 +16,8 @@ rebuilt around it.
 | Mean release-year gap to the seed | 17.1 years | **4.1 years** |
 | Results returned when asking for 15 | ≤ 5 (bug) | 15 |
 | Features | 8 | 14 groups (15 dims) |
-| Tests | 0 | 67 |
+| Tests | 0 | 78 |
+| Apps | PyQt6 GUI | PyQt6 desktop app + Streamlit web test bench |
 
 How these numbers are measured, and their caveats, is in
 [docs/EVALUATION.md](docs/EVALUATION.md).
@@ -41,6 +42,9 @@ How these numbers are measured, and their caveats, is in
 - Save/load fitted models; every knob lives in one JSON-serialisable `EngineConfig`
 
 **Tooling**
+- **Desktop app** (PyQt6, `music-rec-gui`): song radio with live search, playlist
+  builder with weights and dislikes, mood explorer, per-recommendation
+  explanations, CSV export, and side-by-side comparison with the legacy model
 - **Streamlit test bench**: song radio, playlist builder, mood explorer, explain
   view, live benchmark, dataset explorer, and a side-by-side comparison with the
   legacy model
@@ -49,7 +53,8 @@ How these numbers are measured, and their caveats, is in
 - **Evaluation harness**: same-artist retrieval on a validation/test artist
   split, beyond-accuracy metrics, ablations, weight sweeps, sensitivity
   analysis, random-search tuner
-- **67 pytest tests**: a fast synthetic-data suite (~2 s) plus opt-in full-dataset and app smoke tests
+- **78 pytest tests**: a fast synthetic-data suite including headless desktop-GUI tests (~3 s), plus
+  opt-in full-dataset and Streamlit smoke tests
 
 ## Quick start
 
@@ -58,10 +63,16 @@ git clone git@github.com:Ramtin-Mandom/Music-Recommender-Remake.git
 cd Music-Recommender-Remake
 python -m venv .venv
 .venv\Scripts\activate              # macOS/Linux: source .venv/bin/activate
-pip install -e ".[app,dev]"
+pip install -e ".[desktop,app,dev]"
 ```
 
-Launch the test bench:
+Launch the desktop app:
+
+```bash
+music-rec-gui
+```
+
+Or the browser-based test bench:
 
 ```bash
 streamlit run app/streamlit_app.py
@@ -130,7 +141,8 @@ Details and formulas: [docs/ALGORITHM.md](docs/ALGORITHM.md).
 ```
 src/music_recommender/   engine package (config, data, features, catalog, ranking, recommender, legacy, cli)
 src/music_recommender/evaluation/   metrics, protocols, benchmarks, tuning
-app/streamlit_app.py     interactive test bench
+src/music_recommender/gui.py   PyQt6 desktop app (`music-rec-gui`)
+app/streamlit_app.py     browser-based test bench
 tests/                   pytest suite
 data/raw/tracks.csv      170k-track Spotify dataset
 data/legacy/             original CMPT 310 results

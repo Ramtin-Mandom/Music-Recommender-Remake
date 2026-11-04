@@ -7,11 +7,11 @@ Python 3.10+ is required (3.12 recommended).
 ```bash
 python -m venv .venv
 # Windows: .venv\Scripts\activate      macOS/Linux: source .venv/bin/activate
-pip install -e ".[app,dev]"
+pip install -e ".[desktop,app,dev]"
 ```
 
-`pip install -e .` alone installs just the engine and CLI. `[app]` adds
-Streamlit and Plotly, and `[dev]` adds pytest and ruff. `requirements.txt` lists
+`pip install -e .` alone installs just the engine and CLI. `[desktop]` adds
+PyQt6 for the desktop app, `[app]` adds Streamlit and Plotly, and `[dev]` adds pytest and ruff. `requirements.txt` lists
 the same packages for a plain `pip install -r requirements.txt`.
 
 Optional, for fast start-up: pre-build the model once (~5 s).
@@ -20,7 +20,30 @@ Optional, for fast start-up: pre-build the model once (~5 s).
 music-rec build          # writes artifacts/model.joblib
 ```
 
-## The test-bench app
+## The desktop app
+
+```bash
+music-rec-gui                       # or: python -m music_recommender.gui
+```
+
+A native window (PyQt6). The engine loads in the background (instantly if
+`artifacts/model.joblib` exists), and the status bar says when it's ready.
+
+| Tab | How to use it |
+|---|---|
+| **Song radio** | Type a title (optionally an artist, or "Title by Artist") and matches appear as you type, best first. Double-click a match, press Enter, or click **Find similar songs**. |
+| **Playlist builder** | Search, pick a weight, then **Add to liked** or **Add to disliked** (double-clicking a match adds it to liked). **Generate playlist** builds from all of them. Select entries and use **Remove selected** to edit. |
+| **Mood explorer** | Tick attributes, drag sliders, then click **Find matching songs**. |
+| **Explain** | Double-click any recommendation in another tab to see per-feature closeness and share of difference, plus a seeds-vs-track attribute table. |
+
+The left panel holds engine settings (k, diversity, popularity prior,
+strategy, artist cap) and filters (years, minimum popularity, explicit).
+Changing them refreshes the visible results. **Compare with legacy model**
+fits the original CMPT 310 model in the background and shows its results
+side by side. **Export CSV…** (or *File → Export*, Ctrl+E) saves the current
+list.
+
+## The browser test bench
 
 ```bash
 streamlit run app/streamlit_app.py

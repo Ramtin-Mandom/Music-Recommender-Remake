@@ -14,9 +14,9 @@ original code onto the new one and lists what changed and why.
 | `Src/KNNModel.py` | `data.py`, `features.py`, `catalog.py`, `recommender.py`, `ranking.py` | Split by responsibility |
 | model settings in `KNNModel.py` | `legacy.LEGACY_CONFIG` | Exact preset, used as the benchmark baseline |
 | `Src/Evaluation.py` | `evaluation/` | Old metric kept, new protocols added |
-| `Src/GUI.py` (PyQt6) | `app/streamlit_app.py` | Web test bench with comparison, explain and eval tabs |
+| `Src/GUI.py` (PyQt6) | `gui.py` (`music-rec-gui`) + `app/streamlit_app.py` | Rebuilt PyQt6 desktop app on the new engine, plus a web test bench with evaluation tabs |
 | `Src/testApp.py` | `cli.py` (`music-rec`) | Full CLI with sub-commands |
-| — | `tests/` | 67 automated tests (none before) |
+| — | `tests/` | 78 automated tests (none before) |
 
 ## Bugs fixed
 

@@ -19,10 +19,14 @@ dependencies = [
 
 [project.optional-dependencies]
 app = ["streamlit>=1.30", "plotly>=5.18"]
+desktop = ["PyQt6>=6.5"]
 dev = ["pytest>=8", "ruff>=0.5"]
 
 [project.scripts]
 music-rec = "music_recommender.cli:main"
+
+[project.gui-scripts]
+music-rec-gui = "music_recommender.gui:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

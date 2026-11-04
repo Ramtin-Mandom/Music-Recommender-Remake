@@ -17,8 +17,9 @@ Music-Recommender-Remake/
 │   │   ├── protocols.py        # Evaluator: seeded query sets + accuracy / beyond-accuracy protocols
 │   │   └── tuning.py           # benchmark presets, random search, sensitivity, weight sweeps
 │   ├── cli.py                  # `music-rec` command line
+│   ├── gui.py                  # PyQt6 desktop app (`music-rec-gui`)
 │   └── __main__.py             # `python -m music_recommender`
-├── app/streamlit_app.py        # interactive test bench
+├── app/streamlit_app.py        # browser-based test bench
 ├── tests/                      # pytest suite (synthetic data + opt-in full-data tests)
 ├── data/
 │   ├── raw/tracks.csv          # 170k-track Spotify dataset (from CMPT 310)
@@ -30,9 +31,9 @@ Music-Recommender-Remake/
 ## Layering
 
 ```
-          app/streamlit_app.py          cli.py
-                    \                    /
-                     ▼                  ▼
+      gui.py      app/streamlit_app.py      cli.py
+          \                 │                  /
+           ▼                ▼                 ▼
                    recommender.Recommender  ◄──── evaluation/* (uses only the public API
                     │      │       │                          + recommend_rows)
           ┌─────────┘      │       └─────────┐
@@ -42,8 +43,8 @@ Music-Recommender-Remake/
           └──────► data.py ◄┘            config.py (imported by everything)
 ```
 
-* **Nothing below `recommender.py` knows about UIs or evaluation.** The app and
-  CLI are thin. Anything they can do is available from Python.
+* **Nothing below `recommender.py` knows about UIs or evaluation.** The desktop
+  app, web app and CLI are thin. Anything they can do is available from Python.
 * **`EngineConfig` is the single source of truth** for behaviour. It is a
   frozen dataclass, so it is hashable, comparable and safe to share. The
   benchmark uses this to reuse a fitted index across configs that share a
