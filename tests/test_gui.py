@@ -195,3 +195,35 @@ def test_dataframe_model_formats(engine):
     sim_col = gui.RESULT_COLS.index("similarity")
     assert model.data(model.index(0, sim_col)).endswith("%")
     assert model.data(model.index(0, 0), gui.ROW_ROLE) == int(recs.loc[0, "row"])
+
+
+def test_paste_playlist_import(win, popups, tracks):
+    tab = win.playlist
+    tab._clear()
+    song3 = tracks.loc[tracks["name"] == "Song 3", "id"].iloc[0]
+    lines = [
+        f"https://open.spotify.com/track/{song3}?si=x",
+        "Stand by Me - Ben E. King",
+        "spotify:track:0000000000000000000000",
+    ]
+    text = "\n".join(lines)
+    tab.import_text(text)
+    assert tab.liked.count() == 2
+    assert popups[-1] == ("information", "Playlist imported")
+    assert tab.last_import.summary().startswith("Matched 2 of 3")
+    assert [i.status for i in tab.last_import.unmatched] == ["not in catalogue"]
+    assert "Matched 2 of 3" in win.statusBar().currentMessage()
+    tab.import_text("nothing that exists here - nobody")
+    assert popups[-1] == ("warning", "Nothing imported") and tab.liked.count() == 2
+    tab.run()
+    assert tab.results.model.rowCount() == 15
+    dlg = gui.PasteDialog(win)  # builds without errors
+    assert dlg.text.toPlainText() == ""
+
+
+def test_light_green_cells_use_black_text(engine):
+    recs = engine.similar_to("Song 10", k=3)
+    model = gui.DataFrameModel(recs, columns=gui.RESULT_COLS)
+    idx = model.index(0, gui.RESULT_COLS.index("similarity"))
+    assert model.data(idx, gui.Qt.ItemDataRole.ForegroundRole) == gui.QColor("black")
+    assert "QHeaderView::section { background: #d5f5e3; color: black;" in gui.STYLE

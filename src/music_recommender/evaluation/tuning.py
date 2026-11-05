@@ -20,12 +20,15 @@ def benchmark_configs(base: EngineConfig | None = None) -> dict[str, EngineConfi
     return {
         "legacy (CMPT 310 model)": LEGACY_CONFIG,
         "remake (default)": base,
+        "remake - no genre": base.with_overrides(weights={"genre": 0.0}),
+        "remake - no artist sound": base.with_overrides(weights={"artist_sound": 0.0}),
+        "remake - audio only (v2.0 features)": base.with_overrides(weights={"genre": 0.0, "artist_sound": 0.0}),
         "remake - no era feature": base.with_overrides(weights={"era": 0.0}),
         "remake - standard scaling": base.with_overrides(scaling="standard"),
         "remake - centroid only": base.with_overrides(strategy="centroid"),
         "remake - no popularity prior": base.with_overrides(popularity_weight=0.0),
+        "remake - no version penalty": base.with_overrides(version_penalty=0.0),
         "remake - no MMR diversity": base.with_overrides(diversity=0.0),
-        "remake - cosine metric": base.with_overrides(metric="cosine"),
     }
 
 
@@ -42,7 +45,7 @@ def run_benchmark(
     rows = []
     fitted: dict[tuple, Recommender] = {}
     for name, cfg in configs.items():
-        space = (tuple(sorted(cfg.weights.items())), cfg.scaling, cfg.metric)
+        space = (tuple(sorted(cfg.weights.items())), cfg.scaling, cfg.metric, cfg.genre_dims, cfg.artist_shrinkage)
         engine = fitted.get(space)
         if engine is None:
             engine = Recommender(cfg).fit(tracks)
@@ -68,7 +71,7 @@ def random_search(
     base: EngineConfig | None = None,
     trials: int = 30,
     n_queries: int = 150,
-    max_weight: float = 2.5,
+    max_weight: float = 6.0,
     frozen: tuple[str, ...] = ("era",),
     min_gain: float = 0.001,
     seed: int = 0,
@@ -82,10 +85,10 @@ def random_search(
     ``min_gain`` (a guard against hill-climbing on evaluation noise).  Scored
     on the *validation* artists only.
 
-    ``frozen`` groups keep their weight.  ``era`` is frozen by default: the
-    same-artist objective rewards era matching so strongly that an unfrozen
-    search turns the engine into a "same release year" recommender (see
-    docs/EVALUATION.md, "Era trade-off").
+    ``frozen`` groups keep their weight.  ``era`` is frozen by default:
+    collaborators are contemporaries, so the objective rewards era matching
+    and an unfrozen search drifts towards a "same release year" recommender
+    (see docs/EVALUATION.md, section 4).
     """
     rng = np.random.default_rng(seed)
     base = base or EngineConfig()

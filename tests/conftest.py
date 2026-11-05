@@ -5,53 +5,68 @@ import pytest
 
 from music_recommender import EngineConfig, Recommender, clean_tracks, make_synthetic_tracks
 
+QUEEN = {"genres": "['classic rock', 'glam rock', 'rock']", "artist_followers": 45_000_000.0, "artist_popularity": 85.0}
+
 
 def _with_named_tracks(raw: pd.DataFrame) -> pd.DataFrame:
-    """Add a few hand-made rows used by search / dedupe tests."""
+    """Add a few hand-made rows (v2 layout) used by search / dedupe / version tests."""
     base = raw.iloc[0].to_dict()
+    row1 = raw.iloc[1].to_dict()
     extra = [
         {
             **base,
-            "id": "boh0000000000000000001",
+            **QUEEN,
+            "track_id": "boh0000000000000000001",
             "name": "Bohemian Rhapsody - Remastered 2011",
-            "artists": "['Queen']",
-            "popularity": 90,
-            "year": 1975,
+            "track_artists": "Queen",
+            "popularity": 90.0,
+            "album_release_date": "1975-10-31",
         },
         {
+            # no credited artist: the name must be recovered from the artist key
             **base,
-            "id": "boh0000000000000000002",
+            **QUEEN,
+            "track_id": "boh0000000000000000002",
             "name": "Bohemian Rhapsody - Live",
-            "artists": "['Queen']",
-            "popularity": 30,
-            "year": 1979,
+            "track_artists": None,
+            "popularity": 30.0,
+            "album_release_date": "1979",
             "energy": min(base["energy"] + 0.01, 1.0),
         },
         {
             **base,
-            "id": "boh0000000000000000003",
+            "track_id": "boh0000000000000000003",
             "name": "Bohemian Rhapsody",
-            "artists": "['Rockabye Baby!']",
-            "popularity": 20,
-            "year": 2009,
+            "track_artists": "Rockabye Baby!",
+            "genres": "['lullaby']",
+            "artist_followers": 70_000.0,
+            "artist_popularity": 40.0,
+            "popularity": 20.0,
+            "album_release_date": "2009-01-01",
         },
         {
             **base,
-            "id": "sbm0000000000000000001",
+            "track_id": "sbm0000000000000000001",
             "name": "Stand by Me",
-            "artists": "['Ben E. King']",
-            "popularity": 80,
-            "year": 1961,
+            "track_artists": "Ben E. King",
+            "genres": "['soul', 'rhythm and blues']",
+            "artist_followers": 1_200_000.0,
+            "artist_popularity": 70.0,
+            "popularity": 80.0,
+            "album_release_date": "1961-01-01",
         },
+        {**row1, "track_id": "dup0000000000000000001", "popularity": 0.0},  # duplicate of row 1, less popular
+        {**base, "track_id": "brk0000000000000000001", "name": "Broken Tempo", "tempo": 0.0},
         {
+            # an artist that is never credited anywhere: dropped by default
             **base,
-            "id": "dup0000000000000000001",
-            "name": "Song 1",
-            "artists": raw.iloc[1]["artists"],
-            "popularity": 0,
-            "year": int(raw.iloc[1]["year"]),
-        },  # exact duplicate of row 1, less popular
-        {**base, "id": "brk0000000000000000001", "name": "Broken Tempo", "artists": "['Nobody']", "tempo": 0.0},
+            "track_id": "orp0000000000000000001",
+            "name": "Orphan Song",
+            "track_artists": None,
+            "genres": "['mystery']",
+            "artist_followers": 123.0,
+            "artist_popularity": 1.0,
+        },
     ]
     return pd.concat([raw, pd.DataFrame(extra)], ignore_index=True)
 

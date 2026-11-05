@@ -2,7 +2,7 @@
 
 The original ``KNNModel.py`` used:
 
-* 8 audio features (no loudness, key, era, duration or explicit flag),
+* 8 audio features (no loudness, key, era, genre or artist information),
 * ``StandardScaler`` followed by hand-picked weights
   (tempo x2.5, energy x1.5, danceability x1.3),
 * Euclidean k-NN on the plain average of the liked tracks,
@@ -41,4 +41,6 @@ LEGACY_CONFIG = EngineConfig(
     max_per_artist=2,
     dedupe_versions=False,
     dislike_penalty=0.0,
+    version_penalty=0.0,
+    max_seed_artist=2,
 )

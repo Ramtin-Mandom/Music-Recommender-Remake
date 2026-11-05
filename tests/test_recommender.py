@@ -22,7 +22,7 @@ def test_returns_k_results_unlike_legacy_bug(engine):
 
 
 def test_versions_of_seed_are_excluded(engine):
-    recs = engine.similar_to("Bohemian Rhapsody - Remastered 2011", k=20, max_per_artist=5)
+    recs = engine.similar_to("Bohemian Rhapsody - Remastered 2011", k=20, max_per_artist=5, max_seed_artist=5)
     queen = recs[recs["artists"] == "Queen"]
     assert queen.empty  # the live version is the same song
 
@@ -86,7 +86,7 @@ def test_diversity_increases_spread(engine):
 def test_recovers_artist_structure(engine, tracks):
     """Synthetic artists have a distinct style – neighbours should share it."""
     seed = engine.resolve("Song 10")
-    recs = engine.similar_to(seed, k=10, max_per_artist=10, diversity=0.0, popularity_weight=0.0)
+    recs = engine.similar_to(seed, k=10, max_per_artist=10, max_seed_artist=10, diversity=0.0, popularity_weight=0.0)
     same = (recs["artists"] == tracks.loc[seed, "artists_display"]).mean()
     assert same >= 0.5
 
@@ -110,7 +110,73 @@ def test_explain_shares_sum_to_one(engine):
 
 def test_describe(engine):
     d = engine.describe([0, 1])
-    assert {"key", "duration", "tempo"} <= set(d.columns)
+    assert {"key", "duration", "tempo", "genres", "time_signature"} <= set(d.columns)
+    assert (d["duration"] == "?").all()  # no durations in the v2 data
+
+
+def test_seed_artist_cap(engine, tracks):
+    seed = engine.resolve("Song 10")
+    artist = tracks.loc[seed, "artist_key"]
+
+    def own(**kw):
+        rows = engine.recommend_rows([seed], k=15, max_per_artist=10, diversity=0.0, **kw)["row"]
+        return int((tracks.loc[rows, "artist_key"] == artist).sum())
+
+    assert own(max_seed_artist=10) > 1  # synthetic artists are tight clusters
+    assert own(max_seed_artist=1) == 1
+    assert own(max_seed_artist=0) == 0
+
+
+def test_version_penalty(engine, tracks):
+    # Make the closest neighbour of a seed look like a live recording.
+    seed = engine.resolve("Song 10")
+    first = int(engine.recommend_rows([seed], k=1, version_penalty=0.0, diversity=0.0).loc[0, "row"])
+    alt = engine._alt.copy()
+    try:
+        engine._alt[first] = "live"
+        demoted = engine.recommend_rows([seed], k=1, version_penalty=1.0, diversity=0.0)
+        assert int(demoted.loc[0, "row"]) != first
+        engine._alt[seed] = "live"  # a live seed does not penalise live candidates
+        kept = engine.recommend_rows([seed], k=1, version_penalty=1.0, diversity=0.0)
+        assert int(kept.loc[0, "row"]) == first
+    finally:
+        engine._alt[:] = alt
+
+
+def test_flow_order_keeps_tracks_and_smooths(engine):
+    seeds = [engine.resolve("Song 1"), engine.resolve("Song 50")]
+    by_score = engine.recommend_rows(seeds, k=12, diversity=0.4)
+    flow = engine.recommend_rows(seeds, k=12, diversity=0.4, order="flow")
+    assert set(flow["row"]) == set(by_score["row"])
+    assert flow.loc[0, "row"] == by_score.loc[0, "row"]  # the best match still opens
+    assert list(flow["rank"]) == list(range(1, 13))
+
+    from music_recommender.ranking import transition_cost
+
+    def path_cost(rows):
+        rows = list(rows)
+        return sum(
+            transition_cost(engine._tempo, engine._energy, engine._key_angle, a, np.array([b]))[0]
+            for a, b in zip(rows, rows[1:], strict=False)
+        )
+
+    assert path_cost(flow["row"]) <= path_cost(by_score["row"]) + 1e-9
+
+
+def test_genre_filter(engine, tracks):
+    recs = engine.similar_to("Song 10", k=5, filters=Filters(genre="jazz"))
+    assert not recs.empty
+    assert tracks.loc[recs["row"], "genres_display"].str.contains("jazz").all()
+
+
+def test_genre_drives_neighbours(engine, tracks):
+    """Neighbours from other artists should mostly share the seed's genre family."""
+    seed = engine.resolve("Song 10")
+    tags = set(tracks.loc[seed, "genres"])
+    recs = engine.recommend_rows([seed], k=10, max_seed_artist=0, diversity=0.0)
+    rec_tags = tracks.loc[recs["row"], "genres"]
+    tagged = rec_tags[rec_tags.map(len) > 0]
+    assert tagged.map(lambda g: bool(set(g) & tags)).mean() >= 0.7
 
 
 def test_with_config_reuses_fit_for_ranking_changes(engine):

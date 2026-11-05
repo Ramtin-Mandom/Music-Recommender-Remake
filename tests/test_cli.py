@@ -57,3 +57,16 @@ def test_build_then_load(capsys, csv_path, tmp_path):
     assert main(["--data", str(csv_path), "build", "--out", str(model)]) == 0
     assert model.exists()
     assert main(["--data", str(csv_path), "--model", str(model), "search", "Song 4"]) == 0
+
+
+def test_import_and_playlist_from_file(capsys, csv_path, tmp_path, raw_tracks):
+    pasted = tmp_path / "pasted.txt"
+    song = raw_tracks.loc[raw_tracks["name"] == "Song 3", "track_id"].iloc[0]
+    lines = [f"https://open.spotify.com/track/{song}", "Stand by Me - Ben E. King", "nope - nobody"]
+    pasted.write_text("\n".join(lines), encoding="utf-8")
+    code, out = run(capsys, csv_path, tmp_path, "import", str(pasted))
+    assert code == 0 and "Matched 2 of 3" in out.out and "no match" in out.out
+    code, out = run(capsys, csv_path, tmp_path, "playlist", "--from-file", str(pasted), "-k", "4")
+    assert code == 0 and "Matched 2 of 3" in out.err and "rank" in out.out
+    code, out = run(capsys, csv_path, tmp_path, "playlist")
+    assert code == 1 and "--like" in out.err

@@ -8,6 +8,7 @@ callers get the full ranked list so a UI can let the user disambiguate.
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from difflib import get_close_matches
 
@@ -15,6 +16,13 @@ import numpy as np
 import pandas as pd
 
 from .data import normalize_text
+
+#: How many of the most popular tracks' titles typo matching looks at.
+FUZZY_LIMIT = 60_000
+_TRACK_LINK_RE = re.compile(
+    r"https?://(?:open|play)\.spotify\.com/(?:intl-[a-z]{2}(?:-[a-z]{2})?/)?(?:embed/)?track/([0-9A-Za-z]{22})",
+    re.IGNORECASE,
+)
 
 
 class TrackNotFoundError(LookupError):
@@ -62,6 +70,9 @@ class TrackRef:
         text = str(value).strip()
         if text.startswith("spotify:track:"):
             return cls(track_id=text.split(":")[-1])
+        link = _TRACK_LINK_RE.match(text)
+        if link:  # https://open.spotify.com/track/<id>?si=...
+            return cls(track_id=link.group(1))
         if len(text) == 22 and text.isalnum() and not text.isalpha() and " " not in text:
             return cls(track_id=text)
         return cls(title=text)
@@ -85,11 +96,18 @@ class TrackCatalog:
     def __init__(self, tracks: pd.DataFrame):
         self.tracks = tracks
         self._title = tracks["title_norm"].to_numpy(dtype=object)
+        self._title_s = pd.Series(self._title)
         self._base = tracks["version_key"].str.split("|").str[0].to_numpy(dtype=object)
         self._artist = tracks["artist_norm"].to_numpy(dtype=object)
         self._popularity = tracks["popularity"].to_numpy(dtype=float)
-        self._id_to_row = pd.Series(np.arange(len(tracks)), index=tracks["id"].to_numpy())
+        id_to_row = dict(zip(tracks["id"], range(len(tracks)), strict=True))
+        if "alias_ids" in tracks:  # ids of duplicate copies dropped during cleaning
+            for row, aliases in enumerate(tracks["alias_ids"]):
+                for alias in aliases:
+                    id_to_row.setdefault(alias, row)
+        self._id_to_row = id_to_row
         self._unique_titles: list[str] | None = None
+        self._exact_index: tuple | None = None
 
     def __len__(self) -> int:
         return len(self.tracks)
@@ -111,15 +129,16 @@ class TrackCatalog:
         if not q:
             return self._empty_result()
 
-        title_s = pd.Series(self._title)
         score = np.zeros(len(self._title))
-        contains = title_s.str.contains(q, regex=False).to_numpy()
-        score[contains] = 0.7
-        starts = contains & title_s.str.startswith(q).to_numpy()
-        score[starts] = 0.85
+        # Only one full scan; the finer match levels are computed on the hits.
+        hits = np.flatnonzero(self._title_s.str.contains(q, regex=False).to_numpy())
+        sub = self._title_s.iloc[hits]
+        level = np.full(len(hits), 0.7)
+        starts = sub.str.startswith(q).to_numpy()
+        level[starts] = 0.85
         # Whole-word prefix ("bohemian rhapsody operatic section ...").
-        word_prefix = starts & title_s.str.slice(0, len(q) + 1).isin([q, q + " "]).to_numpy()
-        score[word_prefix] = 0.95
+        level[starts & sub.str.slice(0, len(q) + 1).isin([q, q + " "]).to_numpy()] = 0.95
+        score[hits] = level
         # Exact title, ignoring version suffixes: "Bohemian Rhapsody" and
         # "Bohemian Rhapsody - Remastered 2011" both count as exact matches, and
         # popularity then picks the canonical release.
@@ -127,18 +146,20 @@ class TrackCatalog:
 
         tokens = q.split()
         if len(tokens) > 1:
-            all_tokens = np.ones(len(self._title), dtype=bool)
+            # Every word present, in any order: narrow the candidates word by word.
+            cand = np.flatnonzero(self._title_s.str.contains(max(tokens, key=len), regex=False).to_numpy())
             for tok in tokens:
-                all_tokens &= title_s.str.contains(tok, regex=False).to_numpy()
-            score[(score == 0) & all_tokens] = 0.6
+                cand = cand[self._title_s.iloc[cand].str.contains(tok, regex=False).to_numpy()]
+            cand = cand[score[cand] == 0]
+            score[cand] = 0.6
 
-        if not score.any():
-            # Fuzzy fallback for typos ("bohemian rapsody").
-            if self._unique_titles is None:
-                self._unique_titles = list(dict.fromkeys(self._title))
-            close = get_close_matches(q, self._unique_titles, n=5, cutoff=0.75)
+        if score.max() < 0.7:
+            # Typo fallback ("bohemian rapsody"); also when only the loose
+            # every-word match fired ("rapsody" is inside "Bohemian Trapsody").
+            close = get_close_matches(q, self._fuzzy_titles(), n=5, cutoff=0.75)
             for rank, title in enumerate(close):
-                score[self._title == title] = 0.55 - 0.01 * rank
+                hit = self._title == title
+                score[hit] = np.maximum(score[hit], 0.65 - 0.01 * rank)
 
         if artist:
             a = normalize_text(artist)
@@ -172,10 +193,38 @@ class TrackCatalog:
             raise TrackNotFoundError(ref.title, ref.artist, self.suggest(ref.title))
         return best_row
 
+    def exact(self, title: str, artist: str | None = None) -> int | None:
+        """Most popular row whose title (with or without version suffix) is
+        exactly ``title``, optionally by an artist containing ``artist``.
+        A dictionary lookup, so much faster than :meth:`search`."""
+        if getattr(self, "_exact_index", None) is None:
+            n = len(self._title)
+            codes, uniques = pd.factorize(np.concatenate([self._title, self._base]))
+            order = np.argsort(codes, kind="stable")
+            bounds = np.searchsorted(codes[order], np.arange(len(uniques) + 1))
+            self._exact_index = ({k: i for i, k in enumerate(uniques)}, order % n, bounds)
+        lookup, rows_sorted, bounds = self._exact_index
+        i = lookup.get(normalize_text(title))
+        if i is None:
+            return None
+        rows = np.unique(rows_sorted[bounds[i] : bounds[i + 1]])
+        if artist:
+            a = normalize_text(artist)
+            rows = rows[[a in self._artist[r] for r in rows]]
+            if rows.size == 0:
+                return None
+        return int(rows[np.argmax(self._popularity[rows])])
+
     def suggest(self, query: str, n: int = 3) -> list[str]:
+        return get_close_matches(normalize_text(query), self._fuzzy_titles(), n=n, cutoff=0.6)
+
+    def _fuzzy_titles(self) -> list[str]:
+        """Distinct titles for typo matching, most popular first and capped
+        (difflib is linear in the number of titles)."""
         if self._unique_titles is None:
-            self._unique_titles = list(dict.fromkeys(self._title))
-        return get_close_matches(normalize_text(query), self._unique_titles, n=n, cutoff=0.6)
+            order = np.argsort(-self._popularity, kind="stable")[:FUZZY_LIMIT]
+            self._unique_titles = list(dict.fromkeys(self._title[order]))
+        return self._unique_titles
 
     def _empty_result(self) -> pd.DataFrame:
         return pd.DataFrame(columns=["row", "id", "name", "artists_display", "year", "popularity", "match"])

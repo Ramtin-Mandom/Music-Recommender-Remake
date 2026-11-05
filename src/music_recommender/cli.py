@@ -17,7 +17,7 @@ from .ranking import Filters
 from .recommender import Recommender
 
 DEFAULT_MODEL_PATH = PROJECT_ROOT / "artifacts" / "model.joblib"
-SHOW_COLS = ["rank", "name", "artists", "year", "popularity", "similarity", "why"]
+SHOW_COLS = ["rank", "name", "artists", "year", "genres", "popularity", "similarity", "why"]
 
 
 def _print_table(df: pd.DataFrame, cols: list[str] | None = None) -> None:
@@ -48,16 +48,23 @@ def _filters(args) -> Filters:
         year_max=args.year_max,
         min_popularity=args.min_popularity,
         exclude_explicit=args.no_explicit,
+        genre=args.genre,
     )
 
 
 def _overrides(args) -> dict:
     out = {}
-    for key in ("diversity", "strategy", "popularity_weight", "max_per_artist"):
+    for key in ("diversity", "strategy", "popularity_weight", "max_per_artist", "max_seed_artist"):
         value = getattr(args, key, None)
         if value is not None:
             out[key] = value
+    if getattr(args, "flow", False):
+        out["order"] = "flow"
     return out
+
+
+def _tracks(args, config: EngineConfig):
+    return load_tracks(args.data, min_tempo=config.min_tempo, require_artist=config.require_artist)
 
 
 # ----------------------------------------------------------------------
@@ -72,17 +79,44 @@ def cmd_similar(args) -> int:
     query = (args.query, args.artist) if args.artist else args.query
     seed = engine.resolve(query)
     s = engine.tracks.iloc[seed]
-    print(f"Seed: {s['name']} – {s['artists_display']} ({s['year']})\n")
+    genres = f" [{s['genres_display']}]" if s["genres_display"] else ""
+    print(f"Seed: {s['name']} – {s['artists_display']} ({s['year']}){genres}\n")
     _print_table(engine.similar_to(seed, k=args.k, filters=_filters(args), **_overrides(args)), SHOW_COLS)
     return 0
 
 
+def _read_text(source: str) -> str:
+    if source == "-":
+        return sys.stdin.read()
+    return Path(source).read_text(encoding="utf-8-sig")
+
+
 def cmd_playlist(args) -> int:
+    if not args.like and not args.from_file:
+        raise ValueError("give at least one --like or a --from-file playlist")
     engine = _load_engine(args)
-    recs = engine.recommend(
-        args.like, disliked=args.dislike or (), k=args.k, filters=_filters(args), **_overrides(args)
-    )
+    rows: list[int] = []
+    if args.from_file:
+        imp = engine.import_playlist(_read_text(args.from_file))
+        print(imp.summary(), file=sys.stderr)
+        for item in imp.unmatched[:10]:
+            print(f"  not imported: {item.text}  ({item.status})", file=sys.stderr)
+        if len(imp.unmatched) > 10:
+            print(f"  ... and {len(imp.unmatched) - 10} more", file=sys.stderr)
+        rows = imp.rows
+    liked = [*rows, *(args.like or [])]
+    if not liked:
+        raise ValueError("none of the pasted songs are in the catalogue")
+    recs = engine.recommend(liked, disliked=args.dislike or (), k=args.k, filters=_filters(args), **_overrides(args))
     _print_table(recs, SHOW_COLS)
+    return 0
+
+
+def cmd_import(args) -> int:
+    engine = _load_engine(args)
+    imp = engine.import_playlist(_read_text(args.file))
+    print(imp.summary() + "\n")
+    _print_table(imp.report(engine.tracks).fillna(""))
     return 0
 
 
@@ -109,8 +143,8 @@ def cmd_build(args) -> int:
 def cmd_evaluate(args) -> int:
     from .evaluation import benchmark_configs, run_benchmark
 
-    tracks = load_tracks(args.data)
     base = EngineConfig.load(args.config) if args.config else EngineConfig()
+    tracks = _tracks(args, base)
     print(f"Benchmarking on the '{args.split}' artists ({args.queries} queries per task)...")
     table = run_benchmark(tracks, benchmark_configs(base), split=args.split, n_queries=args.queries)
     out_dir = Path(args.out)
@@ -125,8 +159,8 @@ def cmd_evaluate(args) -> int:
 def cmd_tune(args) -> int:
     from .evaluation import random_search
 
-    tracks = load_tracks(args.data)
     base = EngineConfig.load(args.config) if args.config else EngineConfig()
+    tracks = _tracks(args, base)
     frozen = () if args.unfreeze_era else ("era",)
     result = random_search(tracks, base=base, trials=args.trials, n_queries=args.queries, seed=args.seed, frozen=frozen)
     out = Path(args.out)
@@ -141,21 +175,27 @@ def cmd_tune(args) -> int:
 def cmd_analyze(args) -> int:
     from .evaluation import feature_sensitivity, weight_sweep
 
-    tracks = load_tracks(args.data)
     base = EngineConfig.load(args.config) if args.config else EngineConfig()
+    tracks = _tracks(args, base)
     out_dir = Path(args.out)
     out_dir.mkdir(parents=True, exist_ok=True)
-    print("Era-weight sweep (validation artists)...")
-    sweep = weight_sweep(tracks, "era", [0.0, 0.5, 1.0, 1.5, 2.0, 2.5, 3.5], base=base, n_queries=args.queries)
-    sweep.to_csv(out_dir / "era_sweep.csv", index=False)
+    sweeps = {
+        "era": [0.0, 0.75, 1.5, 2.5, 3.5],
+        "genre": [0.0, 1.0, 2.5, 3.5, 5.0],
+        "artist_sound": [0.0, 0.5, 1.0, 1.75, 2.5],
+    }
+    for group, values in sweeps.items():
+        print(f"{group} weight sweep (validation artists)...")
+        sweep = weight_sweep(tracks, group, values, base=base, n_queries=args.queries)
+        sweep.to_csv(out_dir / f"{group}_sweep.csv", index=False)
+        _print_table(sweep.round(4))
+        print()
     print("\nPer-feature sensitivity (validation artists)...")
     sens = feature_sensitivity(tracks, base=base, n_queries=args.queries)
     sens.to_csv(out_dir / "feature_sensitivity.csv", index=False)
     print()
-    _print_table(sweep.round(4))
-    print()
     _print_table(sens)
-    print(f"\nSaved era_sweep.csv and feature_sensitivity.csv to {out_dir}")
+    print(f"\nSaved the *_sweep.csv files and feature_sensitivity.csv to {out_dir}")
     return 0
 
 
@@ -177,6 +217,9 @@ def build_parser() -> argparse.ArgumentParser:
         sp.add_argument("--strategy", choices=["centroid", "nearest_seed", "hybrid"])
         sp.add_argument("--popularity-weight", type=float)
         sp.add_argument("--max-per-artist", type=int)
+        sp.add_argument("--max-seed-artist", type=int, help="songs allowed by the seeds' own artists")
+        sp.add_argument("--genre", help='keep only artists with a matching genre tag, e.g. "soul"')
+        sp.add_argument("--flow", action="store_true", help="order the list into smooth transitions")
 
     sp = sub.add_parser("search", help="find tracks in the catalogue")
     sp.add_argument("query")
@@ -191,10 +234,19 @@ def build_parser() -> argparse.ArgumentParser:
     sp.set_defaults(func=cmd_similar)
 
     sp = sub.add_parser("playlist", help="playlist from several liked (and disliked) songs")
-    sp.add_argument("--like", action="append", required=True, help="repeatable")
+    sp.add_argument("--like", action="append", help="repeatable")
     sp.add_argument("--dislike", action="append", help="repeatable")
+    sp.add_argument(
+        "--from-file",
+        metavar="FILE",
+        help="liked songs pasted from Spotify (links/URIs/'Title - Artist' lines/CSV); '-' reads stdin",
+    )
     add_filters(sp)
     sp.set_defaults(func=cmd_playlist)
+
+    sp = sub.add_parser("import", help="check how a pasted Spotify playlist matches the catalogue")
+    sp.add_argument("file", help="text/CSV file with Spotify links, URIs or 'Title - Artist' lines; '-' reads stdin")
+    sp.set_defaults(func=cmd_import)
 
     sp = sub.add_parser("mood", help="tracks matching target attributes, e.g. energy=0.9 tempo=128")
     sp.add_argument("target", nargs="+", help="attribute=value pairs")
@@ -211,7 +263,7 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--out", default=str(PROJECT_ROOT / "reports"))
     sp.set_defaults(func=cmd_evaluate)
 
-    sp = sub.add_parser("analyze", help="era-weight sweep + per-feature sensitivity analysis")
+    sp = sub.add_parser("analyze", help="era / genre / artist-sound weight sweeps + per-feature sensitivity")
     sp.add_argument("--queries", type=int, default=300)
     sp.add_argument("--out", default=str(PROJECT_ROOT / "reports"))
     sp.set_defaults(func=cmd_analyze)

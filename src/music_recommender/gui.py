@@ -31,6 +31,8 @@ from PyQt6.QtWidgets import (
     QApplication,
     QCheckBox,
     QComboBox,
+    QDialog,
+    QDialogButtonBox,
     QDoubleSpinBox,
     QFileDialog,
     QFormLayout,
@@ -44,6 +46,7 @@ from PyQt6.QtWidgets import (
     QListWidgetItem,
     QMainWindow,
     QMessageBox,
+    QPlainTextEdit,
     QProgressBar,
     QPushButton,
     QScrollArea,
@@ -65,7 +68,8 @@ from .ranking import Filters
 from .recommender import Recommender
 
 MODEL_PATH = PROJECT_ROOT / "artifacts" / "model.joblib"
-RESULT_COLS = ["rank", "name", "artists", "year", "popularity", "similarity", "why"]
+RESULT_COLS = ["rank", "name", "artists", "year", "genres", "popularity", "similarity", "why"]
+YEAR_LO, YEAR_HI = 1900, 2025
 ROW_ROLE = Qt.ItemDataRole.UserRole
 WEIGHT_ROLE = Qt.ItemDataRole.UserRole.value + 1
 
@@ -82,11 +86,12 @@ QPushButton:disabled { background: #a9dfbf; }
 QPushButton[flat="true"] { background: transparent; color: #1e8449; }
 QTabBar::tab { padding: 7px 14px; }
 QTabBar::tab:selected { background: #2ecc71; color: white; border-radius: 4px; }
-QHeaderView::section { background: #d5f5e3; padding: 4px; border: none; font-weight: 600; }
+QHeaderView::section { background: #d5f5e3; color: black; padding: 4px; border: none; font-weight: 600; }
 QLabel#Title { font-size: 16pt; font-weight: 700; color: #064420; }
 QLabel#Subtitle { color: #2c6e49; }
 QLabel#Hint { color: #5d6d7e; }
-QProgressBar { border: 1px solid #c8e6d4; border-radius: 3px; text-align: center; height: 14px; }
+QProgressBar { border: 1px solid #c8e6d4; border-radius: 3px; text-align: center; height: 14px;
+               color: black; background: #f4fbf7; }
 QProgressBar::chunk { background: #58d68d; }
 """
 
@@ -183,6 +188,9 @@ class DataFrameModel(QAbstractTableModel):
         if role == Qt.ItemDataRole.BackgroundRole and col == "similarity":
             v = max(0.0, min(1.0, float(value)))
             return QColor(int(255 - 120 * v), 255, int(255 - 120 * v))
+        if role == Qt.ItemDataRole.ForegroundRole and col == "similarity":
+            # Always black on the light-green cell, whatever the system theme's text colour.
+            return QColor("black")
         if role == ROW_ROLE and "row" in self._full.columns:
             return int(self._full.iloc[index.row()]["row"])
         return None
@@ -226,7 +234,7 @@ class TrackSearch(QWidget):
         self.matches = QListWidget()
         self.matches.setMinimumHeight(90)
         self.matches.setMaximumHeight(130)
-        self.status = QLabel("Type to search 154k tracks.", objectName="Hint")
+        self.status = QLabel("Type a title to search the catalogue.", objectName="Hint")
 
         row = QHBoxLayout()
         row.addWidget(self.title, 3)
@@ -253,7 +261,7 @@ class TrackSearch(QWidget):
         self.matches.clear()
         q = self.title.text().strip()
         if not q or self.engine is None:
-            self.status.setText("Type to search 154k tracks." if self.engine else "Engine loading...")
+            self.status.setText("Type a title to search the catalogue." if self.engine else "Engine loading...")
             return
         artist = self.artist.text().strip() or None
         hits = self.engine.search(q, artist, limit=25)
@@ -359,6 +367,10 @@ class SettingsPanel(QWidget):
         self.strategy.addItems(["hybrid", "centroid", "nearest_seed"])
         self.strategy.setCurrentText(config.strategy)
         self.max_artist = ranged(QSpinBox(), 1, 10, config.max_per_artist)
+        self.max_seed = ranged(QSpinBox(), 0, 10, config.max_seed_artist)
+        self.max_seed.setToolTip("How many songs by the seed songs' own artists a list may contain.")
+        self.flow = QCheckBox("Order as a smooth flow")
+        self.flow.setToolTip("Re-order the chosen tracks so tempo, energy and key change gradually.")
         self.div_label = QLabel()
         self.pop_label = QLabel()
 
@@ -369,10 +381,14 @@ class SettingsPanel(QWidget):
         f.addRow(self.pop_label, self.popularity)
         f.addRow("Multi-seed strategy", self.strategy)
         f.addRow("Max per artist", self.max_artist)
+        f.addRow("Songs by seed artist", self.max_seed)
+        f.addRow(self.flow)
 
-        self.year_min = ranged(QSpinBox(), 1921, 2020, 1921)
-        self.year_max = ranged(QSpinBox(), 1921, 2020, 2020)
+        self.year_min = ranged(QSpinBox(), YEAR_LO, YEAR_HI, YEAR_LO)
+        self.year_max = ranged(QSpinBox(), YEAR_LO, YEAR_HI, YEAR_HI)
         self.min_pop = ranged(QSpinBox(), 0, 100, 0)
+        self.genre = QLineEdit(placeholderText="e.g. soul, indie, metal")
+        self.genre.setClearButtonEnabled(True)
         self.no_explicit = QCheckBox("Exclude explicit tracks")
         flt = QGroupBox("Filters")
         g = QFormLayout(flt)
@@ -382,6 +398,7 @@ class SettingsPanel(QWidget):
         years.addWidget(self.year_max)
         g.addRow("Years", years)
         g.addRow("Min popularity", self.min_pop)
+        g.addRow("Genre contains", self.genre)
         g.addRow(self.no_explicit)
 
         self.compare = QCheckBox("Compare with legacy model")
@@ -401,8 +418,10 @@ class SettingsPanel(QWidget):
         self._defaults = config
         self._timer = QTimer(self, singleShot=True, interval=200)
         self._timer.timeout.connect(self.changed.emit)
-        for w in (self.k, self.max_artist, self.year_min, self.year_max, self.min_pop):
+        for w in (self.k, self.max_artist, self.max_seed, self.year_min, self.year_max, self.min_pop):
             w.valueChanged.connect(self._timer.start)
+        self.genre.textChanged.connect(self._timer.start)
+        self.flow.toggled.connect(self._timer.start)
         for s in (self.diversity, self.popularity):
             s.valueChanged.connect(self._update_labels)
             s.valueChanged.connect(self._timer.start)
@@ -430,9 +449,12 @@ class SettingsPanel(QWidget):
         self.popularity.setValue(int(c.popularity_weight * 100))
         self.strategy.setCurrentText(c.strategy)
         self.max_artist.setValue(c.max_per_artist)
-        self.year_min.setValue(1921)
-        self.year_max.setValue(2020)
+        self.max_seed.setValue(c.max_seed_artist)
+        self.flow.setChecked(c.order == "flow")
+        self.year_min.setValue(YEAR_LO)
+        self.year_max.setValue(YEAR_HI)
         self.min_pop.setValue(0)
+        self.genre.clear()
         self.no_explicit.setChecked(False)
 
     def overrides(self) -> dict:
@@ -441,15 +463,18 @@ class SettingsPanel(QWidget):
             "popularity_weight": self.popularity.value() / 100,
             "strategy": self.strategy.currentText(),
             "max_per_artist": self.max_artist.value(),
+            "max_seed_artist": self.max_seed.value(),
+            "order": "flow" if self.flow.isChecked() else "score",
         }
 
     def filters(self) -> Filters:
         lo, hi = sorted((self.year_min.value(), self.year_max.value()))
         return Filters(
-            year_min=lo if lo > 1921 else None,
-            year_max=hi if hi < 2020 else None,
+            year_min=lo if lo > YEAR_LO else None,
+            year_max=hi if hi < YEAR_HI else None,
             min_popularity=self.min_pop.value() or None,
             exclude_explicit=self.no_explicit.isChecked(),
+            genre=self.genre.text().strip() or None,
         )
 
 
@@ -538,6 +563,35 @@ class RadioTab(RecommendTab):
         return f"Similar to “{t['name']}” — {t['artists_display']} ({t['year']})"
 
 
+class PasteDialog(QDialog):
+    """Paste songs copied from Spotify (or typed) to import them as liked seeds."""
+
+    HELP = (
+        "<b>From the Spotify app:</b> open a playlist, click a song, press <b>Ctrl+A</b> then "
+        "<b>Ctrl+C</b> (Cmd on a Mac), and paste here. You get one link per song.<br>"
+        "Also accepted: <code>spotify:track:</code> URIs, lines like <i>Title - Artist</i>, "
+        "or a CSV export (e.g. Exportify). Album and playlist <i>links</i> can't be expanded "
+        "without the Spotify API: copy the songs instead."
+    )
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Paste a playlist")
+        self.resize(640, 420)
+        info = QLabel(self.HELP, wordWrap=True)
+        self.text = QPlainTextEdit(
+            placeholderText="https://open.spotify.com/track/...\nhttps://open.spotify.com/track/...\nTake On Me - a-ha"
+        )
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        buttons.button(QDialogButtonBox.StandardButton.Ok).setText("Import")
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        lay = QVBoxLayout(self)
+        lay.addWidget(info)
+        lay.addWidget(self.text, 1)
+        lay.addWidget(buttons)
+
+
 class PlaylistTab(RecommendTab):
     def __init__(self, window):
         super().__init__(window)
@@ -555,6 +609,9 @@ class PlaylistTab(RecommendTab):
         remove.setProperty("flat", True)
         clear = QPushButton("Clear all")
         clear.setProperty("flat", True)
+        paste = QPushButton("Paste from Spotify…")
+        paste.setToolTip("Import songs copied from a Spotify playlist (links), URIs, 'Title - Artist' lines or a CSV.")
+        paste.setStyleSheet("background:#1db954;")
         self.button = QPushButton("Generate playlist")
 
         adder = QHBoxLayout()
@@ -572,6 +629,7 @@ class PlaylistTab(RecommendTab):
         actions = QHBoxLayout()
         actions.addWidget(remove)
         actions.addWidget(clear)
+        actions.addWidget(paste)
         actions.addStretch(1)
         actions.addWidget(self.button)
 
@@ -593,6 +651,7 @@ class PlaylistTab(RecommendTab):
         self.search.picked.connect(lambda _row: self.add(liked=True))
         remove.clicked.connect(self._remove)
         clear.clicked.connect(self._clear)
+        paste.clicked.connect(self._paste_dialog)
         self.button.clicked.connect(self.run)
 
     def add(self, liked: bool, row: int | None = None) -> None:
@@ -609,6 +668,36 @@ class PlaylistTab(RecommendTab):
         item.setData(ROW_ROLE, row)
         item.setData(WEIGHT_ROLE, weight)
         target.addItem(item)
+
+    def _paste_dialog(self) -> None:
+        if self.win.engine is None:
+            return
+        dlg = PasteDialog(self)
+        if dlg.exec() == QDialog.DialogCode.Accepted:
+            self.import_text(dlg.text.toPlainText())
+
+    def import_text(self, text: str) -> None:
+        """Add every matched song from pasted text to the liked list and report the rest."""
+        engine = self.win.engine
+        if engine is None or not text.strip():
+            return
+        imp = engine.import_playlist(text)
+        before = self.liked.count()
+        for row in imp.rows:
+            self.add(liked=True, row=row)
+        added = self.liked.count() - before
+        message = imp.summary() + f"\n{added} added to your liked songs."
+        problems = imp.unmatched
+        if problems:
+            shown = "\n".join(f"• {i.text}  ({i.status})" for i in problems[:12])
+            more = f"\n… and {len(problems) - 12} more" if len(problems) > 12 else ""
+            message += f"\n\nNot imported:\n{shown}{more}"
+        self.last_import = imp
+        self.win.statusBar().showMessage(imp.summary(), 8000)
+        if imp.rows:
+            QMessageBox.information(self, "Playlist imported", message)
+        else:
+            QMessageBox.warning(self, "Nothing imported", message)
 
     @staticmethod
     def _rows(lst: QListWidget) -> list[int]:
@@ -656,7 +745,7 @@ MOOD_SPEC = [
     ("liveness", 0, 100, 10, 0.01, False),
     ("tempo", 40, 220, 120, 1.0, False),
     ("loudness", -40, 0, -6, 1.0, False),
-    ("year", 1921, 2020, 2010, 1.0, False),
+    ("year", 1950, 2025, 2015, 1.0, False),
 ]
 
 
@@ -817,7 +906,10 @@ class MainWindow(QMainWindow):
             tab.explain_requested.connect(self._explain)
 
         title = QLabel("Music Recommender Remake", objectName="Title")
-        subtitle = QLabel("Content-based k-NN recommendations over Spotify audio features", objectName="Subtitle")
+        subtitle = QLabel(
+            "Content-based k-NN recommendations over Spotify audio features, genres and artist sound",
+            objectName="Subtitle",
+        )
         side = QScrollArea()
         side.setWidgetResizable(True)
         side.setWidget(self.settings)
@@ -848,7 +940,7 @@ class MainWindow(QMainWindow):
         if engine is not None:
             self._engine_loaded(engine)
         else:
-            self.statusBar().showMessage("Loading 154k tracks and fitting the engine…")
+            self.statusBar().showMessage("Loading the catalogue (~7 s with a built model, ~35 s from the CSV)…")
             self._threads.append(run_in_thread(self, loader, self._engine_loaded, self._load_failed))
 
     # ---- menu ------------------------------------------------------------

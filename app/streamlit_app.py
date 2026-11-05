@@ -23,7 +23,7 @@ from music_recommender.features import GROUP_LABELS  # noqa: E402
 
 MODEL_PATH = ROOT / "artifacts" / "model.joblib"
 RADAR_FEATURES = ["danceability", "energy", "valence", "acousticness", "instrumentalness", "liveness", "speechiness"]
-TABLE_COLS = ["rank", "name", "artists", "year", "popularity", "similarity", "why"]
+TABLE_COLS = ["rank", "name", "artists", "year", "genres", "popularity", "similarity", "why"]
 
 st.set_page_config(page_title="Music Recommender Remake", layout="wide")
 
@@ -31,7 +31,7 @@ st.set_page_config(page_title="Music Recommender Remake", layout="wide")
 # ----------------------------------------------------------------------
 # Engine loading (cached across reruns and sessions)
 # ----------------------------------------------------------------------
-@st.cache_resource(show_spinner="Loading 170k tracks and fitting the engine...")
+@st.cache_resource(show_spinner="Loading the catalogue and fitting the engine (about 30 s without a built model)...")
 def get_engine() -> Recommender:
     if MODEL_PATH.exists():
         try:
@@ -83,6 +83,8 @@ def overrides() -> dict:
         "popularity_weight": ss.popularity_weight,
         "strategy": ss.strategy,
         "max_per_artist": ss.max_per_artist,
+        "max_seed_artist": ss.max_seed_artist,
+        "order": "flow" if ss.flow else "score",
     }
 
 
@@ -94,6 +96,7 @@ def current_filters() -> Filters:
         year_max=y1 if y1 < hi else None,
         min_popularity=ss.min_pop or None,
         exclude_explicit=ss.no_explicit,
+        genre=ss.genre.strip() or None,
     )
 
 
@@ -186,16 +189,30 @@ with st.sidebar:
         help="How several liked songs are combined (see docs/ALGORITHM.md).",
     )
     st.number_input("Max tracks per artist", 1, 10, engine.config.max_per_artist, key="max_per_artist")
+    st.number_input(
+        "Songs by the seeds' own artists",
+        0,
+        10,
+        engine.config.max_seed_artist,
+        key="max_seed_artist",
+        help="Keeps radio from turning into the seed artist's discography.",
+    )
+    st.checkbox(
+        "Order as a smooth flow",
+        key="flow",
+        help="Re-orders the chosen tracks so tempo, energy and key change gradually, like a DJ set.",
+    )
     st.header("Filters")
     lo, hi = int(engine.tracks["year"].min()), int(engine.tracks["year"].max())
     st.slider("Release years", lo, hi, (lo, hi), key="years")
     st.slider("Minimum popularity", 0, 100, 0, key="min_pop")
+    st.text_input("Genre contains", key="genre", placeholder="e.g. soul, indie, metal")
     st.checkbox("Exclude explicit tracks", key="no_explicit")
     st.header("Compare")
     st.checkbox("Show the legacy CMPT 310 model side by side", key="compare")
 
 st.title("Music Recommender Remake")
-st.caption("Content-based k-NN recommendations over Spotify audio features — test bench")
+st.caption("Content-based k-NN recommendations over Spotify audio features, genres and artist sound — test bench")
 
 tab_radio, tab_playlist, tab_mood, tab_explain, tab_eval, tab_data = st.tabs(
     ["Song radio", "Playlist builder", "Mood explorer", "Explain", "Evaluate", "Dataset"]
@@ -235,15 +252,48 @@ with tab_playlist:
         if row not in ss.disliked:
             ss.disliked.append(row)
 
+    with st.expander("Paste a playlist from Spotify"):
+        st.markdown(
+            "In the Spotify app, open a playlist, click a song, press **Ctrl+A** then **Ctrl+C** "
+            "(Cmd on a Mac) and paste below: one link per song. `spotify:track:` URIs, "
+            "*Title - Artist* lines and CSV exports (e.g. Exportify) work too. Album or playlist "
+            "*links* can't be expanded without the Spotify API."
+        )
+        pasted = st.text_area(
+            "Songs",
+            key="pl_paste",
+            height=160,
+            placeholder="https://open.spotify.com/track/...",
+            label_visibility="collapsed",
+        )
+        if st.button("Import as liked songs", key="pl_import", disabled=not pasted.strip()):
+            imp = engine.import_playlist(pasted)
+            known = {r for r, _ in ss.liked}
+            added = [r for r in imp.rows if r not in known]
+            ss.liked.extend((r, weight) for r in added)
+            ss.last_import = (imp.summary() + f" {len(added)} added to your liked songs.", imp.report(engine.tracks))
+        if ss.get("last_import"):
+            summary, report = ss.last_import
+            st.success(summary)
+            problems = report[~report["status"].isin(["matched", "duplicate"])]
+            if not problems.empty:
+                st.caption("Not imported")
+                st.dataframe(problems[["input", "status", "note"]], hide_index=True, width="stretch")
+
     lc, dc = st.columns(2)
     with lc:
         st.markdown(f"**Liked ({len(ss.liked)})**")
-        for i, (r, w) in enumerate(list(ss.liked)):
+        for i, (r, w) in enumerate(list(ss.liked)[:15]):
             a, b = st.columns([4, 1])
             a.write(f"{track_label(r)} · weight {w:g}")
             if b.button("Remove", key=f"rm_like_{i}"):
                 ss.liked.pop(i)
                 st.rerun()
+        if len(ss.liked) > 15:
+            st.caption(f"… and {len(ss.liked) - 15} more")
+        if ss.liked and st.button("Clear liked", key="clear_liked"):
+            ss.liked.clear()
+            st.rerun()
     with dc:
         st.markdown(f"**Disliked ({len(ss.disliked)})**")
         for i, r in enumerate(list(ss.disliked)):
@@ -297,7 +347,7 @@ with tab_mood:
         ("speechiness", 0.0, 1.0, 0.05, 0.01),
         ("tempo", 40, 220, 120, 1),
         ("loudness", -40.0, 0.0, -6.0, 0.5),
-        ("year", 1921, 2020, 2010, 1),
+        ("year", 1950, 2025, 2015, 1),
     ]
     cols = st.columns(3)
     for i, (name, lo_, hi_, default, step) in enumerate(spec):
@@ -346,8 +396,8 @@ with tab_eval:
     st.subheader("Offline evaluation")
     st.markdown(
         "Benchmarks the legacy model, the remake and single-change ablations on held-out artists. "
-        "**precision@k** = share of the top-k that are *other songs by the seed's artist* "
-        "(artist is not a model input). See `docs/EVALUATION.md`."
+        "**precision@k** = share of the top-k (seed artist's own songs removed) by an artist the seed "
+        'artist has collaborated with ("feat." credits, which the model never sees). See `docs/EVALUATION.md`.'
     )
     report = ROOT / "reports" / "benchmark.csv"
     n_q = st.slider("Queries per task", 50, 500, 150, 50)
@@ -391,7 +441,7 @@ with tab_data:
     c1.metric("Tracks", f"{len(t):,}")
     c2.metric("Distinct songs", f"{t['version_key'].nunique():,}")
     c3, c4 = st.columns(2)
-    c3.metric("Artists", f"{t['primary_artist'].nunique():,}")
+    c3.metric("Artists", f"{t['artist_key'].nunique():,}")
     c4.metric("Years", f"{t['year'].min()}-{t['year'].max()}")
     feat = st.selectbox("Feature distribution", [*RADAR_FEATURES, "tempo", "loudness", "year", "popularity"])
     fig = go.Figure(go.Histogram(x=t[feat], nbinsx=60, marker_color="#1f77b4"))
@@ -402,3 +452,6 @@ with tab_data:
         "weight", ascending=False
     )
     st.dataframe(w, hide_index=True)
+    st.markdown("**Most common genre tags**")
+    tags = t["genres"].explode().dropna().value_counts().head(25).rename_axis("genre").reset_index(name="tracks")
+    st.dataframe(tags, hide_index=True)

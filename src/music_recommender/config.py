@@ -2,7 +2,7 @@
 
 Every tunable knob of the recommender lives in :class:`EngineConfig` so that an
 experiment is fully described by one (serialisable) object.  The defaults are
-hand-set values validated on the bundled dataset by an era-weight sweep and a
+validated on the v2 dataset with the collaborator protocol, weight sweeps and a
 per-feature sensitivity analysis (``music-rec analyze``; see
 ``docs/EVALUATION.md``).
 """
@@ -32,8 +32,22 @@ AUDIO_FEATURES: tuple[str, ...] = (
 )
 
 #: Every feature *group* the pipeline can produce.  A group may expand to
-#: several columns (``key`` becomes a sin/cos pair on the circle of fifths).
-FEATURE_GROUPS: tuple[str, ...] = (*AUDIO_FEATURES, "key", "mode", "era", "duration", "explicit")
+#: several columns: ``key`` becomes a sin/cos pair on the circle of fifths,
+#: ``genre`` a dense embedding of the artist's genre tags, and
+#: ``artist_sound`` the average sound of the rest of the artist's catalogue.
+#: Groups the dataset cannot support (``genre`` without genres, ``duration``
+#: when most durations are missing) are skipped automatically.
+FEATURE_GROUPS: tuple[str, ...] = (
+    *AUDIO_FEATURES,
+    "key",
+    "mode",
+    "meter",
+    "era",
+    "duration",
+    "explicit",
+    "genre",
+    "artist_sound",
+)
 
 #: A weight multiplies a feature *after* scaling, so it scales that feature's
 #: share of the distance.  Groups missing from the mapping get weight 0 (i.e.
@@ -51,13 +65,17 @@ DEFAULT_WEIGHTS: dict[str, float] = {
     "loudness": 0.9,
     "key": 0.15,
     "mode": 0.15,
+    "meter": 0.15,
     "era": 1.5,
     "duration": 0.35,
     "explicit": 0.5,
+    "genre": 3.0,
+    "artist_sound": 1.5,
 }
 
 Strategy = Literal["centroid", "nearest_seed", "hybrid"]
 Scaling = Literal["standard", "robust", "quantile"]
+Order = Literal["score", "flow"]
 
 
 @dataclass(frozen=True)
@@ -69,6 +87,13 @@ class EngineConfig:
     scaling: Scaling = "quantile"
     """``quantile`` maps every feature to a standard normal (robust to the very
     skewed speechiness / liveness / instrumentalness distributions)."""
+
+    genre_dims: int = 16
+    """Size of the genre embedding (TF-IDF over tags -> truncated SVD)."""
+    artist_shrinkage: float = 3.0
+    """Pseudo-count pulling ``artist_sound`` towards the track itself for
+    artists with few songs (an artist with n other songs gets weight
+    n / (n + shrinkage) on their average)."""
 
     # ---- retrieval -----------------------------------------------------
     metric: Literal["euclidean", "cosine", "manhattan"] = "euclidean"
@@ -86,15 +111,28 @@ class EngineConfig:
     # ---- re-ranking ------------------------------------------------------
     popularity_weight: float = 0.08
     """Blend factor of the (normalised) popularity prior into the final score."""
+    artist_popularity_share: float = 0.3
+    """Share of the popularity prior taken from the *artist's* popularity
+    (the rest is the track's own; a quarter of tracks have popularity 0)."""
+    version_penalty: float = 0.15
+    """Score subtracted from alternate versions (live, demo, karaoke, sped up
+    ...) unless a seed is the same kind of version."""
     diversity: float = 0.15
     """MMR trade-off: 0 = pure relevance, 1 = pure novelty w.r.t. the list."""
     max_per_artist: int = 2
+    max_seed_artist: int = 1
+    """How many songs by the seeds' own artists a list may contain."""
+    order: Order = "score"
+    """``score`` lists by relevance; ``flow`` re-orders the chosen tracks into
+    smooth transitions (tempo, energy, key) like a DJ set."""
     dedupe_versions: bool = True
     """Collapse remasters / live versions of the same song by the same artist."""
 
     # ---- data cleaning ---------------------------------------------------
     min_tempo: float = 30.0
     """Rows with a tempo below this are treated as broken (tempo 0 = unknown)."""
+    require_artist: bool = True
+    """Drop tracks whose artist name cannot be recovered."""
 
     random_state: int = 42
 
@@ -143,3 +181,15 @@ class EngineConfig:
             raise ValueError("candidate_pool must be at least 10.")
         if self.max_per_artist < 1:
             raise ValueError("max_per_artist must be at least 1.")
+        if self.order not in ("score", "flow"):
+            raise ValueError("order must be 'score' or 'flow'.")
+        if self.max_seed_artist < 0:
+            raise ValueError("max_seed_artist must be non-negative.")
+        if not 0.0 <= self.artist_popularity_share <= 1.0:
+            raise ValueError("artist_popularity_share must be in [0, 1].")
+        if self.version_penalty < 0:
+            raise ValueError("version_penalty must be non-negative.")
+        if not 2 <= self.genre_dims <= 128:
+            raise ValueError("genre_dims must be between 2 and 128.")
+        if self.artist_shrinkage < 0:
+            raise ValueError("artist_shrinkage must be non-negative.")

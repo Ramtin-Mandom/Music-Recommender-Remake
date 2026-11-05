@@ -8,11 +8,14 @@ Pipeline for every request::
     1. embed seeds in the weighted feature space |
     2. candidate generation: k-NN of the         |
        weighted centroid  +  k-NN of each seed   |
-    3. hard filters (year, popularity, ...)      |
+    3. hard filters (year, popularity, genre ...) |
     4. relevance = f(centroid sim, best-seed sim) - penalty * dislike sim
-    5. blend in a popularity prior
+    5. blend in a popularity prior (track + artist), push down alternate
+       versions (live, demo, karaoke ...) unless a seed is one
     6. collapse versions of the same song
-    7. MMR re-ranking for diversity + per-artist cap
+    7. MMR re-ranking for diversity + per-artist cap (stricter for the
+       seeds' own artists)
+    8. optionally re-order the list into smooth transitions ("flow")
           |
           v
     ranked DataFrame with similarity scores and a short "why" for each track
@@ -34,9 +37,11 @@ from . import __version__
 from .catalog import TrackCatalog, TrackRef
 from .config import DEFAULT_DATA_PATH, EngineConfig
 from .data import load_tracks
-from .features import GROUP_LABELS, FeaturePipeline
-from .ranking import Filters, kernel_similarity, mmr_select
+from .features import GROUP_LABELS, FeaturePipeline, key_to_fifths_angle
+from .importer import PlaylistImport, import_playlist
+from .ranking import Filters, flow_order, kernel_similarity, mmr_select
 
+BINARY_GROUPS = frozenset({"explicit", "mode", "meter"})
 KEY_NAMES = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"]
 
 RESULT_COLUMNS = [
@@ -45,6 +50,7 @@ RESULT_COLUMNS = [
     "name",
     "artists",
     "year",
+    "genres",
     "popularity",
     "similarity",
     "score",
@@ -62,7 +68,7 @@ class Recommender:
 
         rec = Recommender.from_csv()                 # load + fit (~5 s)
         rec.similar_to("Bohemian Rhapsody", k=10)    # "song radio"
-        rec.recommend(["Africa by Toto", "Take On Me"], disliked=["Macarena"])
+        rec.recommend(["Africa by Toto", "Take On Me"], disliked=["bad guy"])
         rec.from_targets({"energy": 0.9, "valence": 0.8, "tempo": 128})
     """
 
@@ -82,7 +88,8 @@ class Recommender:
     @classmethod
     def from_csv(cls, path: str | Path = DEFAULT_DATA_PATH, config: EngineConfig | None = None) -> Recommender:
         config = config or EngineConfig()
-        return cls(config).fit(load_tracks(path, min_tempo=config.min_tempo))
+        tracks = load_tracks(path, min_tempo=config.min_tempo, require_artist=config.require_artist)
+        return cls(config).fit(tracks)
 
     def fit(self, tracks: pd.DataFrame) -> Recommender:
         """Fit on a *cleaned* tracks table (see :func:`music_recommender.data.clean_tracks`)."""
@@ -91,12 +98,28 @@ class Recommender:
         cfg = self.config
         self.tracks = tracks.reset_index(drop=True)
         self.catalog = TrackCatalog(self.tracks)
-        self.pipeline = FeaturePipeline(cfg.weights, cfg.scaling, cfg.random_state)
+        self.pipeline = FeaturePipeline(
+            cfg.weights, cfg.scaling, cfg.random_state, genre_dims=cfg.genre_dims, artist_shrinkage=cfg.artist_shrinkage
+        )
         self.embedding = self.pipeline.fit_transform(self.tracks)
-        self.index = NearestNeighbors(metric=cfg.metric).fit(self.embedding)
-        self._popularity = self.tracks["popularity"].to_numpy(dtype=float) / 100.0
-        self._artists = self.tracks["primary_artist"].str.casefold().to_numpy(dtype=object)
+        # Exact brute-force search.  Euclidean (the default) uses a hand-rolled
+        # matrix product: sklearn re-validates the whole catalogue on every
+        # query, which costs more than the search itself at ~500k tracks.
+        if cfg.metric == "euclidean":
+            self.index = None
+            self._sq_norms = np.einsum("ij,ij->i", self.embedding, self.embedding)
+        else:
+            self.index = NearestNeighbors(metric=cfg.metric, algorithm="brute").fit(self.embedding)
+        track_pop = self.tracks["popularity"].to_numpy(dtype=float) / 100.0
+        artist_pop = self.tracks["artist_popularity"].to_numpy(dtype=float) / 100.0
+        self._track_popularity = track_pop
+        self._artist_popularity = np.where(np.isnan(artist_pop), track_pop, artist_pop)
+        self._artists = self.tracks["artist_key"].to_numpy(dtype=object)
         self._versions = self.tracks["version_key"].to_numpy(dtype=object)
+        self._alt = self.tracks["alt_version"].to_numpy(dtype=object)
+        self._tempo = self.tracks["tempo"].to_numpy(dtype=float)
+        self._energy = self.tracks["energy"].to_numpy(dtype=float)
+        self._key_angle = key_to_fifths_angle(self.tracks["key"].to_numpy(), self.tracks["mode"].to_numpy())
         self.sigma = self._calibrate_sigma()
         self._typical_gap = self._typical_group_gaps()
         return self
@@ -119,7 +142,7 @@ class Recommender:
         neighbour = min(neighbour, n - 1)
         rng = np.random.default_rng(self.config.random_state)
         rows = rng.choice(n, size=min(sample, n), replace=False)
-        dist, _ = self.index.kneighbors(self.embedding[rows], n_neighbors=neighbour + 1)
+        dist, _ = self._knn(self.embedding[rows], neighbour + 1)
         sigma = float(np.median(dist[:, -1]))
         return sigma if sigma > 0 else 1.0
 
@@ -131,7 +154,7 @@ class Recommender:
         """
         self._require_fitted()
         new_cfg = self.config.with_overrides(**overrides)
-        space_keys = ("weights", "scaling", "metric", "random_state")
+        space_keys = ("weights", "scaling", "metric", "random_state", "genre_dims", "artist_shrinkage")
         if all(getattr(new_cfg, k) == getattr(self.config, k) for k in space_keys):
             clone = object.__new__(Recommender)
             clone.__dict__.update(self.__dict__)
@@ -173,6 +196,17 @@ class Recommender:
                 raise IndexError(f"Row {track} out of range.")
             return int(track)
         return self.catalog.resolve(track)
+
+    def import_playlist(self, text: str) -> PlaylistImport:
+        """Match a pasted playlist (Spotify links / URIs / "Title - Artist"
+        lines / CSV export) to catalogue rows.  ``result.rows`` are the seeds::
+
+            imp = rec.import_playlist(open("playlist.txt").read())
+            print(imp.summary())
+            rec.recommend_rows(imp.rows, k=20)
+        """
+        self._require_fitted()
+        return import_playlist(text, self.catalog)
 
     def similar_to(self, track: TrackLike, k: int = 10, filters: Filters | None = None, **overrides) -> pd.DataFrame:
         """Tracks that sound like a single seed track ("song radio")."""
@@ -228,13 +262,56 @@ class Recommender:
             cand, exhausted = self._candidates(queries, k, pool, filters, exclude, exclude_versions)
             if cand.size == 0:
                 return self._empty()
-            result = self._rank_candidates(cand, k, cfg, centroid, seeds, weights, disliked_rows)
+            result = self._rank_candidates(cand, k, cfg, centroid, seeds, weights, disliked_rows, seed_rows)
             # The artist cap / version dedupe can starve a small pool: widen it.
             if len(result) >= k or exhausted:
                 return result
             pool *= 4
 
-    def _rank_candidates(self, cand, k, cfg, centroid, seeds, weights, disliked_rows) -> pd.DataFrame:
+    def _prior(self, cand: np.ndarray, cfg: EngineConfig) -> np.ndarray:
+        share = cfg.artist_popularity_share
+        return (1 - share) * self._track_popularity[cand] + share * self._artist_popularity[cand]
+
+    def _shape_scores(self, cand, relevance, cfg, seed_rows=()) -> np.ndarray:
+        """Final score: relevance blended with the popularity prior, minus the
+        alternate-version penalty."""
+        score = (1 - cfg.popularity_weight) * relevance + cfg.popularity_weight * self._prior(cand, cfg)
+        if cfg.version_penalty > 0:
+            allowed = [self._alt[r] for r in seed_rows]
+            alt = self._alt[cand]
+            score = score - cfg.version_penalty * ((alt != "") & ~np.isin(alt, allowed))
+        return score
+
+    def _select(self, cand, score, relevance, k, cfg, seed_rows=()):
+        """Version dedupe, MMR with artist caps, optional flow ordering."""
+        if cfg.dedupe_versions:
+            keep = self._best_per_version(cand, score)
+            cand, score, relevance = cand[keep], score[keep], relevance[keep]
+
+        def pair_sim(i: int, all_idx: np.ndarray) -> np.ndarray:
+            d = self._dist(self.embedding[cand[i]][None, :], self.embedding[cand[all_idx]], cfg)[0]
+            return kernel_similarity(d, self.sigma)
+
+        budget = {self._artists[r]: min(cfg.max_seed_artist, cfg.max_per_artist) for r in seed_rows}
+        picked = np.asarray(
+            mmr_select(
+                cand,
+                score,
+                k,
+                diversity=cfg.diversity,
+                pair_similarity=pair_sim,
+                artists=self._artists[cand],
+                max_per_artist=cfg.max_per_artist,
+                artist_budget=budget,
+            ),
+            dtype=int,
+        )
+        if cfg.order == "flow" and len(picked) > 2:
+            rows = cand[picked]
+            picked = picked[flow_order(self._tempo[rows], self._energy[rows], self._key_angle[rows])]
+        return cand[picked], relevance[picked], score[picked]
+
+    def _rank_candidates(self, cand, k, cfg, centroid, seeds, weights, disliked_rows, seed_rows) -> pd.DataFrame:
         cand_emb = self.embedding[cand]
         sim_centroid = kernel_similarity(self._dist(centroid[None, :], cand_emb, cfg)[0], self.sigma)
         seed_sims = kernel_similarity(self._dist(seeds, cand_emb, cfg), self.sigma)
@@ -249,28 +326,10 @@ class Recommender:
             dis_sim = kernel_similarity(self._dist(dis, cand_emb, cfg), self.sigma).max(axis=0)
             relevance = relevance - cfg.dislike_penalty * dis_sim
 
-        score = (1 - cfg.popularity_weight) * relevance + cfg.popularity_weight * self._popularity[cand]
-
-        if cfg.dedupe_versions:
-            keep = self._best_per_version(cand, score)
-            cand, score, relevance = cand[keep], score[keep], relevance[keep]
-
-        def pair_sim(i: int, all_idx: np.ndarray) -> np.ndarray:
-            d = self._dist(self.embedding[cand[i]][None, :], self.embedding[cand[all_idx]], cfg)[0]
-            return kernel_similarity(d, self.sigma)
-
-        picked = mmr_select(
-            cand,
-            score,
-            k,
-            diversity=cfg.diversity,
-            pair_similarity=pair_sim,
-            artists=self._artists[cand],
-            max_per_artist=cfg.max_per_artist,
-        )
-        rows = cand[picked]
+        score = self._shape_scores(cand, relevance, cfg, seed_rows)
+        rows, rel, sc = self._select(cand, score, relevance, k, cfg, seed_rows)
         anchor = np.vstack([centroid, seeds])
-        return self._format(rows, relevance[picked], score[picked], anchor)
+        return self._format(rows, rel, sc, anchor)
 
     def from_targets(
         self,
@@ -299,27 +358,10 @@ class Recommender:
         top = np.argsort(dist)[: max(cfg.candidate_pool, 20 * k)]
         cand, d = rows[top], dist[top]
         relevance = kernel_similarity(d, self.sigma)
-        score = (1 - cfg.popularity_weight) * relevance + cfg.popularity_weight * self._popularity[cand]
-        if cfg.dedupe_versions:
-            keep = self._best_per_version(cand, score)
-            cand, score, relevance = cand[keep], score[keep], relevance[keep]
-
-        def pair_sim(i: int, all_idx: np.ndarray) -> np.ndarray:
-            dd = self._dist(self.embedding[cand[i]][None, :], self.embedding[cand[all_idx]], cfg)[0]
-            return kernel_similarity(dd, self.sigma)
-
-        picked = mmr_select(
-            cand,
-            score,
-            k,
-            diversity=cfg.diversity,
-            pair_similarity=pair_sim,
-            artists=self._artists[cand],
-            max_per_artist=cfg.max_per_artist,
-        )
-        rows = cand[picked]
+        score = self._shape_scores(cand, relevance, cfg)
+        rows, rel, sc = self._select(cand, score, relevance, k, cfg)
         anchor = np.where(mask, vec, np.nan)[None, :]
-        return self._format(rows, relevance[picked], score[picked], anchor)
+        return self._format(rows, rel, sc, anchor)
 
     # ------------------------------------------------------------------
     # Explanations / inspection
@@ -329,6 +371,7 @@ class Recommender:
         self._require_fitted()
         sub = self.tracks.iloc[list(rows)]
         out = sub[["id", "name", "artists_display", "year", "popularity"]].copy()
+        out["genres"] = sub["genres_display"]
         for col in ["danceability", "energy", "valence", "acousticness", "instrumentalness", "liveness", "speechiness"]:
             out[col] = sub[col].round(3)
         out["tempo"] = sub["tempo"].round(1)
@@ -336,7 +379,10 @@ class Recommender:
         out["key"] = [
             f"{KEY_NAMES[k]} {'major' if m else 'minor'}" for k, m in zip(sub["key"], sub["mode"], strict=True)
         ]
-        out["duration"] = (sub["duration_ms"] / 60000).map(lambda m: f"{int(m)}:{int((m % 1) * 60):02d}")
+        out["time_signature"] = sub["time_signature"].map(lambda t: f"{t}/4" if t else "?")
+        out["duration"] = (sub["duration_ms"] / 60000).map(
+            lambda m: "?" if pd.isna(m) else f"{int(m)}:{int((m % 1) * 60):02d}"
+        )
         out["explicit"] = sub["explicit"].astype(bool)
         return out.rename(columns={"artists_display": "artists"}).reset_index(drop=True)
 
@@ -349,7 +395,7 @@ class Recommender:
         """
         self._require_fitted()
         centroid = self.embedding[list(seed_rows)].mean(axis=0)
-        diff = self.embedding[row] - centroid
+        diff = (self.embedding[row] - centroid).astype(float)
         unweighted = diff / self.pipeline.column_weights
         total = float((diff**2).sum()) or 1.0
         records = []
@@ -390,6 +436,27 @@ class Recommender:
     def _dist(a: np.ndarray, b: np.ndarray, cfg: EngineConfig) -> np.ndarray:
         return pairwise_distances(a, b, metric=cfg.metric)
 
+    def _knn(self, queries: np.ndarray, n_neighbors: int) -> tuple[np.ndarray, np.ndarray]:
+        """(distances, indices) of the ``n_neighbors`` nearest catalogue rows, sorted."""
+        if self.index is not None:
+            return self.index.kneighbors(queries, n_neighbors=n_neighbors)
+        q = np.asarray(queries, dtype=np.float32)
+        n = len(self.embedding)
+        dists, idxs = [], []
+        for start in range(0, len(q), 64):  # bound the (queries x catalogue) block
+            block = q[start : start + 64]
+            d2 = self._sq_norms[None, :] - 2.0 * (block @ self.embedding.T)
+            d2 += np.einsum("ij,ij->i", block, block)[:, None]
+            if n_neighbors < n:
+                part = np.argpartition(d2, n_neighbors - 1, axis=1)[:, :n_neighbors]
+            else:
+                part = np.tile(np.arange(n), (len(block), 1))
+            pd2 = np.take_along_axis(d2, part, axis=1)
+            order = np.argsort(pd2, axis=1, kind="stable")
+            idxs.append(np.take_along_axis(part, order, axis=1))
+            dists.append(np.sqrt(np.maximum(np.take_along_axis(pd2, order, axis=1), 0.0)))
+        return np.vstack(dists), np.vstack(idxs)
+
     def _candidates(self, queries, k, pool, filters, exclude, exclude_versions) -> tuple[np.ndarray, bool]:
         """k-NN candidates for every query vector, filtered, growing the pool
         until enough candidates survive the filters.
@@ -401,7 +468,7 @@ class Recommender:
         pool = min(n, pool)
         while True:
             per_query = pool if len(queries) == 1 else max(pool // 2, 2 * k)
-            _, idx = self.index.kneighbors(queries, n_neighbors=min(n, per_query))
+            _, idx = self._knn(queries, min(n, per_query))
             cand = np.unique(idx.ravel())
             if exclude:
                 cand = cand[~np.isin(cand, list(exclude))]
@@ -429,10 +496,13 @@ class Recommender:
         d = np.where(valid, emb - np.nan_to_num(anchor), 0.0)
         nearest = anchor[np.argmin((d**2).sum(axis=1))] if anchor.shape[0] > 1 else anchor[0]
         unweighted = (emb - nearest) / self.pipeline.column_weights
-        max_w = max(self.config.weights.values())
         scores = []
         for group, cols in self.pipeline.group_slices().items():
-            if np.isnan(nearest[cols]).any() or self.config.weights[group] < 0.35 * max_w:
+            if np.isnan(nearest[cols]).any() or self.config.weights[group] < 0.5:
+                continue
+            # Sharing the common value of a flag (both *not* explicit) says
+            # nothing; only a shared rare value is worth mentioning.
+            if group in BINARY_GROUPS and not (emb[cols[0]] > 0 and nearest[cols[0]] > 0):
                 continue
             gap = float(np.sqrt((unweighted[cols] ** 2).sum()))
             # Floor the ratio so near-exact ties (e.g. two tracks with zero
@@ -453,6 +523,7 @@ class Recommender:
                 "name": sub["name"].to_numpy(),
                 "artists": sub["artists_display"].to_numpy(),
                 "year": sub["year"].to_numpy(),
+                "genres": sub["genres"].map(lambda g: ", ".join(g[:3])).to_numpy(),
                 "popularity": sub["popularity"].to_numpy(),
                 "similarity": np.clip(relevance, 0, 1).round(3),
                 "score": np.round(score, 4),

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "music-recommender-remake"
-version = "2.0.0"
+version = "3.1.0"
 description = "A content-based k-NN music recommendation engine with a Streamlit test bench."
 readme = "README.md"
 license = { file = "LICENSE" }
@@ -33,7 +33,7 @@ where = ["src"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-markers = ["slow: uses the full 170k-track dataset (deselect with -m 'not slow')"]
+markers = ["slow: uses the full v2 dataset (data/raw/tracks.csv) (deselect with -m 'not slow')"]
 
 [tool.ruff]
 line-length = 120
